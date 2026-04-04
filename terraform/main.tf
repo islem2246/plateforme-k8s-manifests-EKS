@@ -5,8 +5,9 @@
 # ⚠️  AWS Academy : iam:CreateRole est interdit.
 #     Utilise exclusivement LabRole (pré-existant).
 #
-# FIX v2 : exclusion du subnet us-east-1e (non supporté par EKS)
-# FIX v3 : ajout OIDC provider pour EBS CSI Driver
+# FIX v5 :
+#   - OIDC provider pour EBS CSI Driver
+#   - bootstrap_self_managed_addons = false (évite destroy du cluster)
 # ============================================================
 
 terraform {
@@ -43,7 +44,7 @@ variable "cluster_name" {
 variable "cluster_version" {
   description = "Version de Kubernetes"
   type        = string
-  default     = "1.32"
+  default     = "1.34"
 }
 
 variable "node_instance_type" {
@@ -83,7 +84,6 @@ data "aws_vpc" "default" {
   default = true
 }
 
-# Récupérer tous les subnets du VPC par défaut
 data "aws_subnets" "all" {
   filter {
     name   = "vpc-id"
@@ -91,13 +91,11 @@ data "aws_subnets" "all" {
   }
 }
 
-# Récupérer les détails de chaque subnet pour lire leur AZ
 data "aws_subnet" "details" {
   for_each = toset(data.aws_subnets.all.ids)
   id       = each.value
 }
 
-# LabRole fourni par AWS Academy
 data "aws_iam_role" "lab_role" {
   name = "LabRole"
 }
@@ -107,10 +105,8 @@ data "aws_iam_role" "lab_role" {
 # ============================================================
 
 locals {
-  # AZ connues pour NE PAS supporter EKS dans us-east-1
   excluded_azs = ["us-east-1e"]
 
-  # Garder uniquement les subnets dans des AZ supportées
   eks_subnet_ids = [
     for subnet in data.aws_subnet.details :
     subnet.id
@@ -128,8 +124,10 @@ resource "aws_eks_cluster" "main" {
 
   role_arn = data.aws_iam_role.lab_role.arn
 
+  # Empêche Terraform de détruire/recréer le cluster lors d'un import
+  bootstrap_self_managed_addons = false
+
   vpc_config {
-    # Utilise uniquement les subnets filtrés (sans us-east-1e)
     subnet_ids              = local.eks_subnet_ids
     endpoint_public_access  = true
     endpoint_private_access = false
@@ -138,8 +136,6 @@ resource "aws_eks_cluster" "main" {
 
   tags = {
     Project     = "plateforme-electronique-paiement"
-    Owner       = "islem2244"
-    Environment = "lab"
     ManagedBy   = "terraform"
   }
 
@@ -179,10 +175,8 @@ resource "aws_eks_node_group" "workers" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "workers"
   node_role_arn   = data.aws_iam_role.lab_role.arn
-
-  subnet_ids = local.eks_subnet_ids
-
-  instance_types = [var.node_instance_type]
+  subnet_ids      = local.eks_subnet_ids
+  instance_types  = [var.node_instance_type]
 
   scaling_config {
     desired_size = var.node_desired
@@ -194,15 +188,9 @@ resource "aws_eks_node_group" "workers" {
     max_unavailable = 1
   }
 
-  labels = {
-    role = "worker"
-  }
-
   tags = {
-    Project     = "plateforme-electronique-paiement"
-    Owner       = "islem2244"
-    Environment = "lab"
-    ManagedBy   = "terraform"
+    Project   = "plateforme-electronique-paiement"
+    ManagedBy = "terraform"
   }
 
   timeouts {
