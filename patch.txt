@@ -1,0 +1,14 @@
+# Frontend
+kubectl patch svc frontend-nodeport -n plateforme-electronique \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+# Keycloak
+kubectl patch svc keycloak-nodeport -n plateforme-electronique \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+----------------------------------------------------------------------
+#
+kubectl get svc -n plateforme-electronique | grep LoadBalancer
+
+Resultat comme : 
+Frontend:  http://ae1a2765e215d4ebb852a5d982ae5868-1363864390.us-east-1.elb.amazonaws.com

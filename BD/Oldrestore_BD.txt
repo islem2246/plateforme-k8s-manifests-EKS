@@ -1,0 +1,9 @@
+# Restaurer une base spécifique
+kubectl exec -i -n plateforme-electronique postgres-8d89d6848-5qlbx -- psql -U postgres -d user_auth_db < ~/backups/user_auth_db.sql
+
+# Restaurer toutes les bases
+kubectl exec -i -n plateforme-electronique postgres-8d89d6848-5qlbx -- psql -U postgres < ~/backups/all_databases.sql
+
+
+# Restaurer directement dans la base
+kubectl exec -i -n plateforme-electronique postgres-xxxxxxxxxxxxx -- psql -U postgres -d user_auth_db < ~/backups/user_auth_db.sql

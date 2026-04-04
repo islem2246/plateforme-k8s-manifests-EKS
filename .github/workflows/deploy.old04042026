@@ -1,0 +1,558 @@
+# ============================================================
+# deploy.yml — Déploiement Plateforme Électronique v12
+# Dépôt      : plateforme-k8s-manifests
+# Namespace  : plateforme-electronique
+# ============================================================
+#
+# MODES DE DÉPLOIEMENT :
+#   kubectl  → kubectl apply direct (rapide, sans ArgoCD)
+#   argocd   → installation ArgoCD + GitOps
+#   sync     → synchronisation ArgoCD uniquement (déjà installé)
+#
+# DÉCLENCHEMENT :
+#   - Manuel  : workflow_dispatch avec choix du mode
+#   - Push    : mode kubectl par défaut (rapide)
+# ============================================================
+
+name: "🚢 Deploy Plateforme v12"
+
+on:
+  push:
+    branches: [ "master" ]
+    paths-ignore:
+      - 'terraform/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode de déploiement'
+        type: choice
+        options:
+          - kubectl
+          - argocd
+          - sync
+        default: kubectl
+      dry_run:
+        description: 'Dry-run (aperçu sans appliquer) — mode kubectl uniquement'
+        type: boolean
+        default: false
+      reinstall_argocd:
+        description: 'Réinstaller ArgoCD même s il existe — mode argocd uniquement'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: plateforme-paiement-eks
+  NAMESPACE: plateforme-electronique
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: plateforme-electronique
+  REPO_URL: https://github.com/islem2246/plateforme-k8s-manifests
+  REPO_BRANCH: master
+  # Sur push automatique → mode kubectl par défaut
+  DEPLOY_MODE: ${{ github.event.inputs.mode || 'kubectl' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # JOB 1 — Vérifications préalables (commun à tous les modes)
+  # ============================================================
+  preflight:
+    name: "🔎 Vérifications préalables"
+    runs-on: ubuntu-latest
+    outputs:
+      argocd_installed: ${{ steps.check-argocd.outputs.installed }}
+      ebs_status: ${{ steps.check-ebs.outputs.status }}
+      deploy_mode: ${{ steps.set-mode.outputs.mode }}
+
+    steps:
+      - name: Définir le mode de déploiement
+        id: set-mode
+        run: |
+          MODE="${{ env.DEPLOY_MODE }}"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  Mode de déploiement : $MODE"
+          echo "║  Branche : ${{ github.ref_name }}"
+          echo "║  Déclencheur : ${{ github.event_name }}"
+          echo "╚══════════════════════════════════════════╝"
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Vérifier que le cluster EKS est ACTIVE
+        run: |
+          STATUS=$(aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query 'cluster.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "Statut EKS : $STATUS"
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "❌ Cluster non disponible — lancer terraform.yml en mode apply"
+            exit 1
+          fi
+          echo "✅ Cluster ACTIVE"
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl get nodes
+
+      - name: Vérifier l'addon EBS CSI Driver
+        id: check-ebs
+        run: |
+          STATUS=$(aws eks describe-addon \
+            --cluster-name "$EKS_CLUSTER_NAME" \
+            --addon-name aws-ebs-csi-driver \
+            --region "$AWS_REGION" \
+            --query 'addon.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "EBS CSI Driver : $STATUS"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Vérifier si ArgoCD est installé
+        id: check-argocd
+        run: |
+          if kubectl get namespace "$ARGOCD_NAMESPACE" &>/dev/null && \
+             kubectl get deployment argocd-server -n "$ARGOCD_NAMESPACE" &>/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ArgoCD déjà installé"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  ArgoCD absent"
+          fi
+
+  # ============================================================
+  # JOB 2 — Infrastructure EBS + StorageClass (commun)
+  # ============================================================
+  infrastructure:
+    name: "⚙️ Infrastructure — EBS + StorageClass"
+    runs-on: ubuntu-latest
+    needs: preflight
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Installer/Vérifier EBS CSI Driver
+        run: |
+          STATUS="${{ needs.preflight.outputs.ebs_status }}"
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "✅ EBS CSI Driver déjà ACTIVE — skip"
+          else
+            echo "=== Installation EBS CSI Driver ==="
+            aws eks delete-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION" 2>/dev/null || true
+            sleep 10
+            aws eks create-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION"
+          fi
+          # Attendre ACTIVE
+          for i in $(seq 1 18); do
+            STATUS=$(aws eks describe-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION" \
+              --query 'addon.status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+            echo "  [${i}/18] EBS CSI : $STATUS"
+            [ "$STATUS" = "ACTIVE" ] && break
+            [ "$STATUS" = "CREATE_FAILED" ] && { echo "❌ CREATE_FAILED"; exit 1; }
+            sleep 10
+          done
+          echo "✅ EBS CSI Driver ACTIVE"
+
+      - name: Créer le StorageClass gp2-csi
+        run: |
+          kubectl patch storageclass gp2 \
+            -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}' \
+            2>/dev/null || true
+          kubectl apply -f - <<EOF
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: gp2-csi
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: ebs.csi.aws.com
+          volumeBindingMode: WaitForFirstConsumer
+          reclaimPolicy: Retain
+          parameters:
+            type: gp2
+          EOF
+          echo "✅ StorageClass gp2-csi OK"
+
+  # ============================================================
+  # JOB 3a — MODE KUBECTL : déploiement direct (miroir deploy.sh)
+  # ============================================================
+  deploy-kubectl:
+    name: "⚡ Deploy — kubectl direct"
+    runs-on: ubuntu-latest
+    needs: [ preflight, infrastructure ]
+    if: needs.preflight.outputs.deploy_mode == 'kubectl'
+    environment: production
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: "[DRY-RUN] Aperçu des manifests"
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          for DIR in 00-namespace 01-secrets-configmaps 02-infrastructure \
+                     03-gateway 04-services 05-frontend 06-ingress \
+                     07-keycloak-realm 08-post-deploy; do
+            [ -d "$DIR" ] && kubectl apply --dry-run=server -R -f "$DIR/" || true
+          done
+
+      - name: "[1/8] Namespace"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 00-namespace/
+
+      - name: "[2/8] Secrets et ConfigMaps"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 01-secrets-configmaps/
+
+      - name: "[3/8] Infrastructure — PostgreSQL, Redis, Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 02-infrastructure/
+
+      - name: "[3/8] ⏳ Attente PostgreSQL (120s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=postgres --timeout=120s \
+          && echo "✅ PostgreSQL prêt" || echo "⚠️  Timeout PostgreSQL"
+
+      - name: "[3/8] ⏳ Attente Redis (90s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=redis --timeout=90s \
+          && echo "✅ Redis prêt" || echo "⚠️  Timeout Redis"
+
+      - name: "[3/8] ⏳ Attente Keycloak (300s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=keycloak --timeout=300s \
+          && echo "✅ Keycloak prêt" || echo "⚠️  Timeout Keycloak"
+
+      - name: "[4/8] API Gateway"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 03-gateway/
+
+      - name: "[5/8] Microservices métier"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 04-services/
+
+      - name: "[6/8] Frontend et Ingress"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 05-frontend/
+          kubectl apply -f 06-ingress/
+
+      - name: "[7/8] Import realm Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 07-keycloak-realm/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/keycloak-realm-import \
+            --timeout=180s \
+          && echo "✅ Realm importé" || echo "⚠️  Timeout realm"
+
+      - name: "[8/8] Seed users"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl delete job seed-users -n "$NAMESPACE" --ignore-not-found=true
+          kubectl apply -f 08-post-deploy/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/seed-users \
+            --timeout=120s \
+          && echo "✅ Utilisateurs créés" || echo "⚠️  Timeout seed-users"
+
+      - name: "✅ État final"
+        if: always()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get svc -n "$NAMESPACE" || true
+
+      - name: "🔴 Debug si échec"
+        if: failure()
+        run: |
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by='.lastTimestamp' | tail -30 || true
+
+  # ============================================================
+  # JOB 3b — MODE ARGOCD : installation + GitOps
+  # ============================================================
+  deploy-argocd:
+    name: "🔄 Deploy — ArgoCD GitOps"
+    runs-on: ubuntu-latest
+    needs: [ preflight, infrastructure ]
+    if: needs.preflight.outputs.deploy_mode == 'argocd'
+    environment: production
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Installer ArgoCD
+        run: |
+          ALREADY="${{ needs.preflight.outputs.argocd_installed }}"
+          REINSTALL="${{ github.event.inputs.reinstall_argocd }}"
+          if [ "$ALREADY" = "true" ] && [ "$REINSTALL" != "true" ]; then
+            echo "✅ ArgoCD déjà installé — skip"
+          else
+            kubectl create namespace "$ARGOCD_NAMESPACE" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -n "$ARGOCD_NAMESPACE" \
+              -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+            echo "✅ ArgoCD installé"
+          fi
+
+      - name: Exposer ArgoCD via LoadBalancer
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: argocd-server-lb
+            namespace: ${ARGOCD_NAMESPACE}
+          spec:
+            type: LoadBalancer
+            selector:
+              app.kubernetes.io/name: argocd-server
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8080
+              - name: https
+                port: 443
+                targetPort: 8080
+          EOF
+
+      - name: Attendre ArgoCD prêt
+        run: |
+          kubectl rollout status deployment/argocd-server \
+            -n "$ARGOCD_NAMESPACE" --timeout=300s
+          echo "✅ ArgoCD Running"
+
+      - name: Installer argocd CLI + Login
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+          # Attendre URL LB
+          for i in $(seq 1 18); do
+            ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+              -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            [ -n "$ARGOCD_URL" ] && break
+            echo "  [${i}/18] Attente LB ArgoCD..."
+            sleep 10
+          done
+          [ -z "$ARGOCD_URL" ] && ARGOCD_URL="localhost:8080" && \
+            kubectl port-forward svc/argocd-server \
+              -n "$ARGOCD_NAMESPACE" 8080:443 & sleep 5
+
+          ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.data.password}' | base64 -d)
+
+          argocd login "$ARGOCD_URL" \
+            --username admin \
+            --password "$ARGOCD_PWD" \
+            --insecure --grpc-web
+
+          echo "ARGOCD_URL=$ARGOCD_URL" >> "$GITHUB_ENV"
+          echo "ARGOCD_PWD=$ARGOCD_PWD" >> "$GITHUB_ENV"
+          echo "✅ Login ArgoCD OK"
+
+      - name: Créer namespace + Application ArgoCD
+        run: |
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f - <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: ${REPO_BRANCH}
+              directory:
+                recurse: true
+                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/**/*.yaml'
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+                - ApplyOutOfSyncOnly=true
+              retry:
+                limit: 5
+                backoff:
+                  duration: 10s
+                  factor: 2
+                  maxDuration: 3m
+          EOF
+          echo "✅ Application ArgoCD créée"
+
+      - name: Synchroniser et attendre Healthy
+        run: |
+          argocd app sync "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure --timeout 300 || true
+          argocd app wait "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure \
+            --health --timeout 600 \
+          && echo "✅ Application Healthy" \
+          || echo "⚠️  Timeout — vérifier UI ArgoCD"
+
+      - name: "✅ Résumé URLs"
+        if: always()
+        run: |
+          ARGOCD_LB=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "N/A")
+          APP_LB=$(kubectl get svc api-gateway-lb \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "N/A")
+          NODE=$(kubectl get nodes \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  ArgoCD UI  → http://$ARGOCD_LB"
+          echo "║  ArgoCD     → admin / $ARGOCD_PWD"
+          echo "║  API GW LB  → http://$APP_LB:8080"
+          echo "║  Frontend   → http://$NODE:30180"
+          echo "║  Keycloak   → http://$NODE:30881"
+          echo "╚══════════════════════════════════════════════════╝"
+
+  # ============================================================
+  # JOB 3c — MODE SYNC : synchronisation ArgoCD uniquement
+  # ============================================================
+  deploy-sync:
+    name: "🔁 Sync — ArgoCD uniquement"
+    runs-on: ubuntu-latest
+    needs: [ preflight, infrastructure ]
+    if: needs.preflight.outputs.deploy_mode == 'sync'
+    environment: production
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Vérifier qu'ArgoCD est installé
+        run: |
+          if [ "${{ needs.preflight.outputs.argocd_installed }}" != "true" ]; then
+            echo "❌ ArgoCD non installé — choisir le mode 'argocd' d'abord"
+            exit 1
+          fi
+          echo "✅ ArgoCD présent"
+
+      - name: Installer argocd CLI + Login + Sync
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+          ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+          [ -z "$ARGOCD_URL" ] && ARGOCD_URL="localhost:8080" && \
+            kubectl port-forward svc/argocd-server \
+              -n "$ARGOCD_NAMESPACE" 8080:443 & sleep 5
+
+          ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.data.password}' | base64 -d)
+
+          argocd login "$ARGOCD_URL" \
+            --username admin \
+            --password "$ARGOCD_PWD" \
+            --insecure --grpc-web
+
+          echo "=== Synchronisation ==="
+          argocd app sync "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure --timeout 300
+          argocd app wait "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure \
+            --health --timeout 600 \
+          && echo "✅ Sync OK" || echo "⚠️  Timeout"
+
+          echo "=== État ==="
+          argocd app get "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure

@@ -1,0 +1,5 @@
+| Variable          | Valeur décodée          |
+| ----------------- | ----------------------- |
+| POSTGRES_USER     | postgres                |
+| POSTGRES_PASSWORD | postgres_password             |
+| POSTGRES_DB       | plateforme_electronique |

@@ -1,0 +1,7 @@
+
+#  EBS CSI Driver = le traducteur entre Kubernetes ("j'ai besoin d'un disque")
+aws eks create-addon \
+  --cluster-name plateforme-paiement-eks \
+  --addon-name aws-ebs-csi-driver \
+  --service-account-role-arn arn:aws:iam::554813750145:role/LabRole \
+  --region us-east-1

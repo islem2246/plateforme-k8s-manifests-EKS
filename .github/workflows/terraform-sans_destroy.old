@@ -1,0 +1,368 @@
+# ============================================================
+# GitHub Actions — Terraform EKS + Deploy Plateforme v12
+# Dépôt      : ngrassa/plateforme-k8s-manifests
+# Compte AWS : 731603087226  |  Région : us-east-1
+# ============================================================
+#
+# SECRETS GITHUB REQUIS :
+#   AWS_ACCESS_KEY_ID       → depuis AWS Academy > AWS Details
+#   AWS_SECRET_ACCESS_KEY   → depuis AWS Academy > AWS Details
+#   AWS_SESSION_TOKEN       → depuis AWS Academy > AWS Details (token complet)
+#
+# STRUCTURE DU DÉPÔT ATTENDUE :
+#   terraform/
+#     main.tf          ← fichier fourni séparément
+#   .github/workflows/
+#     terraform-eks.yml  ← ce fichier
+#   00-namespace/
+#   01-secrets-configmaps/
+#   ...
+#   08-post-deploy/
+#   deploy.sh
+# ============================================================
+
+name: "🏗️ Terraform EKS + 🚢 Deploy Plateforme v12"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Détruire le cluster EKS (terraform destroy)'
+        type: boolean
+        default: false
+      skip_deploy:
+        description: 'Terraform uniquement, sans déployer les manifests'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry-run kubectl (aperçu sans appliquer)'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: plateforme-paiement-eks
+  NAMESPACE: plateforme-electronique
+  TF_DIR: terraform
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # JOB 1 — Terraform : créer / mettre à jour le cluster EKS
+  # ============================================================
+  terraform:
+    name: "🏗️ Terraform — EKS Cluster"
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        shell: bash
+        working-directory: terraform
+
+    outputs:
+      cluster_ready: ${{ steps.apply.outputs.cluster_ready }}
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Vérifier l'identité AWS
+        run: aws sts get-caller-identity
+
+      # ── Terraform CLI ───────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      # ── Init ────────────────────────────────────────────
+      - name: Terraform Init
+        run: terraform init
+
+      # ── Format check ────────────────────────────────────
+      - name: Terraform Format
+        run: terraform fmt -check
+        continue-on-error: true
+
+      # ── Validate ────────────────────────────────────────
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ── Plan (sur PR et push) ────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -input=false \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}" \
+            -out=tfplan
+        env:
+          TF_LOG: WARN
+
+      # ── Résumé du plan sur PR ────────────────────────────
+      - name: Afficher le résumé du plan (PR uniquement)
+        if: github.event_name == 'pull_request'
+        run: terraform show -no-color tfplan | head -80
+
+      # ── Import des ressources existantes (évite "already exists") ──
+      - name: Terraform Import — ressources existantes
+        if: |
+          github.ref == 'refs/heads/master' &&
+          github.event_name != 'pull_request' &&
+          github.event.inputs.destroy != 'true'
+        run: |
+          # Importer le cluster EKS s'il existe déjà
+          if aws eks describe-cluster                --name "$EKS_CLUSTER_NAME"                --region "$AWS_REGION"                --query 'cluster.status'                --output text 2>/dev/null | grep -q "ACTIVE\|CREATING\|UPDATING"; then
+            echo "=== Cluster existant détecté — import dans Terraform ==="
+            terraform import               -var="aws_region=$AWS_REGION"               -var="cluster_name=$EKS_CLUSTER_NAME"               aws_eks_cluster.main "$EKS_CLUSTER_NAME" 2>/dev/null || echo "Déjà importé"
+          else
+            echo "=== Aucun cluster existant — création normale ==="
+          fi
+
+          # Importer le node group s'il existe
+          if aws eks describe-nodegroup                --cluster-name "$EKS_CLUSTER_NAME"                --nodegroup-name workers                --region "$AWS_REGION"                --query 'nodegroup.status'                --output text 2>/dev/null | grep -q "ACTIVE\|CREATING"; then
+            echo "=== Node group existant — import ==="
+            terraform import               -var="aws_region=$AWS_REGION"               -var="cluster_name=$EKS_CLUSTER_NAME"               aws_eks_node_group.workers "$EKS_CLUSTER_NAME:workers" 2>/dev/null || echo "Déjà importé"
+          fi
+
+          # Importer les addons existants
+          declare -A ADDON_MAP
+          ADDON_MAP["vpc-cni"]="vpc_cni"
+          ADDON_MAP["coredns"]="coredns"
+          ADDON_MAP["kube-proxy"]="kube_proxy"
+          ADDON_MAP["aws-ebs-csi-driver"]="ebs_csi"
+
+          for ADDON in "vpc-cni" "coredns" "kube-proxy" "aws-ebs-csi-driver"; do
+            RESOURCE="${ADDON_MAP[$ADDON]}"
+            if aws eks describe-addon                  --cluster-name "$EKS_CLUSTER_NAME"                  --addon-name "$ADDON"                  --region "$AWS_REGION"                  --query 'addon.status'                  --output text 2>/dev/null | grep -q "ACTIVE\|CREATING"; then
+              echo "=== Addon $ADDON — import ==="
+              terraform import                 -var="aws_region=$AWS_REGION"                 -var="cluster_name=$EKS_CLUSTER_NAME"                 "aws_eks_addon.${RESOURCE}"                 "$EKS_CLUSTER_NAME:$ADDON" 2>/dev/null || echo "Déjà importé"
+            fi
+          done
+        env:
+          TF_LOG: WARN
+
+      # ── Recalculer le plan après import ─────────────────
+      - name: Terraform Plan (post-import)
+        if: |
+          github.ref == 'refs/heads/master' &&
+          github.event_name != 'pull_request' &&
+          github.event.inputs.destroy != 'true'
+        run: |
+          terraform plan             -input=false             -var="aws_region=$AWS_REGION"             -var="cluster_name=$EKS_CLUSTER_NAME"             -out=tfplan-final
+        env:
+          TF_LOG: WARN
+
+      # ── Apply ────────────────────────────────────────────
+      - name: Terraform Apply
+        id: apply
+        if: |
+          github.ref == 'refs/heads/master' &&
+          github.event_name != 'pull_request' &&
+          github.event.inputs.destroy != 'true'
+        run: |
+          terraform apply -auto-approve -input=false tfplan-final
+          echo "cluster_ready=true" >> "$GITHUB_OUTPUT"
+        env:
+          TF_LOG: WARN
+
+      # ── Destroy (déclenchement manuel uniquement) ────────
+      - name: Terraform Destroy
+        if: github.event.inputs.destroy == 'true'
+        run: |
+          echo "⚠️  DESTRUCTION du cluster EKS — action irréversible"
+          terraform destroy \
+            -auto-approve \
+            -input=false \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}"
+
+      # ── Outputs Terraform ────────────────────────────────
+      - name: Afficher les outputs Terraform
+        if: steps.apply.conclusion == 'success'
+        run: terraform output
+
+  # ============================================================
+  # JOB 2 — Validation des manifests YAML
+  # ============================================================
+  validate-manifests:
+    name: "🔍 Validate Manifests"
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: |
+      needs.terraform.outputs.cluster_ready == 'true' &&
+      github.event.inputs.skip_deploy != 'true' &&
+      github.event.inputs.destroy != 'true'
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer yamllint
+        run: pip install yamllint --quiet
+
+      - name: Valider tous les dossiers de manifests
+        run: |
+          for DIR in 00-namespace 01-secrets-configmaps 02-infrastructure \
+                     03-gateway 04-services 05-frontend 06-ingress \
+                     07-keycloak-realm 08-post-deploy; do
+            if [ -d "$DIR" ]; then
+              echo "📁 $DIR"
+              find "$DIR" -name "*.yaml" -o -name "*.yml" | sort | while read f; do
+                yamllint -d relaxed "$f" && echo "  ✅ $f" || echo "  ⚠️  $f"
+              done
+            else
+              echo "  ⚠️  Dossier absent : $DIR"
+            fi
+          done
+
+  # ============================================================
+  # JOB 3 — Déploiement Plateforme v12 (miroir deploy.sh)
+  # ============================================================
+  deploy:
+    name: "🚢 Deploy Plateforme v12"
+    runs-on: ubuntu-latest
+    needs: [ terraform, validate-manifests ]
+    if: |
+      needs.terraform.outputs.cluster_ready == 'true' &&
+      github.event.inputs.skip_deploy != 'true' &&
+      github.event.inputs.destroy != 'true'
+    environment: production
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl pour EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl cluster-info
+          kubectl get nodes
+
+      # ── Dry-run global ─────────────────────────────────
+      - name: "[DRY-RUN] Aperçu de tous les manifests"
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          for DIR in 00-namespace 01-secrets-configmaps 02-infrastructure \
+                     03-gateway 04-services 05-frontend 06-ingress \
+                     07-keycloak-realm 08-post-deploy; do
+            [ -d "$DIR" ] && kubectl apply --dry-run=server -R -f "$DIR/" || true
+          done
+
+      # ══════════════════════════════════════════════════
+      # ÉTAPES — miroir exact de deploy.sh v12
+      # ══════════════════════════════════════════════════
+
+      - name: "[1/8] Namespace — plateforme-electronique"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 00-namespace/
+          kubectl get namespace "$NAMESPACE"
+
+      - name: "[2/8] Secrets et ConfigMaps"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 01-secrets-configmaps/
+
+      - name: "[3/8] Infrastructure — PostgreSQL, Redis, Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 02-infrastructure/
+
+      - name: "[3/8] ⏳ Attente PostgreSQL (120s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=postgres --timeout=120s \
+          && echo "✅ PostgreSQL prêt" || echo "⚠️  Timeout PostgreSQL"
+
+      - name: "[3/8] ⏳ Attente Redis (90s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=redis --timeout=90s \
+          && echo "✅ Redis prêt" || echo "⚠️  Timeout Redis"
+
+      - name: "[3/8] ⏳ Attente Keycloak (300s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=keycloak --timeout=300s \
+          && echo "✅ Keycloak prêt" || echo "⚠️  Timeout Keycloak"
+
+      - name: "[4/8] API Gateway"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 03-gateway/
+
+      - name: "[5/8] Microservices métier"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 04-services/
+
+      - name: "[6/8] Frontend et Ingress"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 05-frontend/
+          kubectl apply -f 06-ingress/
+
+      - name: "[7/8] Import du realm Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 07-keycloak-realm/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/keycloak-realm-import \
+            --timeout=180s \
+          && echo "✅ Realm importé" || echo "⚠️  Timeout realm import"
+
+      - name: "[8/8] Seed users"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl delete job seed-users -n "$NAMESPACE" --ignore-not-found=true
+          kubectl apply -f 08-post-deploy/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/seed-users \
+            --timeout=120s \
+          && echo "✅ Utilisateurs créés" || echo "⚠️  Timeout seed-users"
+
+      # ── Résumé final ───────────────────────────────────
+      - name: "✅ État final de la plateforme"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -n "$NAMESPACE" -o wide
+          echo "=== Services ==="
+          kubectl get services -n "$NAMESPACE"
+          echo "=== Jobs ==="
+          kubectl get jobs -n "$NAMESPACE"
+          echo "=== Ingress ==="
+          kubectl get ingress -n "$NAMESPACE" 2>/dev/null || true
+
+      # ── Debug si échec ─────────────────────────────────
+      - name: "🔴 Debug — erreurs et events"
+        if: failure()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by='.lastTimestamp' | tail -30 || true

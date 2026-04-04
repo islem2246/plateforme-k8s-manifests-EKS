@@ -1,0 +1,542 @@
+# ============================================================
+# argocd.yml — Installation ArgoCD + Déploiement via GitOps
+# Dépôt      : ngrassa/plateforme-k8s-manifests
+# Compte AWS : 731603087226  |  Région : us-east-1
+# Namespace  : plateforme-electronique
+# ============================================================
+#
+# CE QUE FAIT CE PIPELINE :
+#   1. Vérifie que le cluster EKS est ACTIVE
+#   2. Vérifie / installe l'addon EBS CSI Driver
+#   3. Crée le StorageClass gp2-csi (CSI driver)
+#   4. Installe ArgoCD dans le namespace argocd
+#   5. Attend qu'ArgoCD soit prêt
+#   6. Crée le namespace plateforme-electronique
+#   7. Crée l'Application ArgoCD pointant sur ce dépôt
+#   8. Déclenche la synchronisation
+#   9. Attend la santé de l'application
+#  10. Affiche les URLs d'accès
+#
+# SECRETS GITHUB REQUIS :
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+#
+# DÉCLENCHEMENT :
+#   - push sur master (hors dossier terraform/)
+#   - manuel (workflow_dispatch)
+# ============================================================
+
+name: "🔄 ArgoCD — Install + Deploy Plateforme v12"
+
+on:
+  push:
+    branches: [ "master" ]
+    paths-ignore:
+      - 'terraform/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      reinstall_argocd:
+        description: 'Réinstaller ArgoCD (même s il existe déjà)'
+        type: boolean
+        default: false
+      sync_only:
+        description: 'Synchroniser uniquement (ArgoCD déjà installé)'
+        type: boolean
+        default: false
+      argocd_version:
+        description: 'Version ArgoCD (ex: v2.10.0)'
+        required: false
+        default: 'stable'
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: plateforme-paiement-eks
+  NAMESPACE: plateforme-electronique
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: plateforme-electronique
+  REPO_URL: https://github.com/ngrassa/plateforme-k8s-manifests
+  REPO_BRANCH: master
+  ARGOCD_VERSION: ${{ github.event.inputs.argocd_version || 'stable' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # JOB 1 — Vérifications préalables
+  # ============================================================
+  preflight:
+    name: "🔎 Vérifications préalables"
+    runs-on: ubuntu-latest
+
+    outputs:
+      argocd_installed: ${{ steps.check-argocd.outputs.installed }}
+      ebs_status: ${{ steps.check-ebs.outputs.status }}
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Vérifier EKS ─────────────────────────────────────
+      - name: Vérifier que le cluster EKS est ACTIVE
+        run: |
+          STATUS=$(aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query 'cluster.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "Statut EKS : $STATUS"
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "❌ Cluster '$EKS_CLUSTER_NAME' non disponible (status: $STATUS)"
+            echo "→ Lancer d'abord le workflow 'Terraform — EKS Cluster' en mode apply"
+            exit 1
+          fi
+          echo "✅ Cluster EKS ACTIVE"
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl get nodes
+
+      # ── Vérifier EBS CSI Driver ───────────────────────────
+      - name: Vérifier l'addon EBS CSI Driver
+        id: check-ebs
+        run: |
+          STATUS=$(aws eks describe-addon \
+            --cluster-name "$EKS_CLUSTER_NAME" \
+            --addon-name aws-ebs-csi-driver \
+            --region "$AWS_REGION" \
+            --query 'addon.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "EBS CSI Driver : $STATUS"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "⚠️  EBS CSI Driver non actif — sera installé dans le job suivant"
+          else
+            echo "✅ EBS CSI Driver ACTIVE"
+          fi
+
+      # ── Vérifier nodes suffisants ─────────────────────────
+      - name: Vérifier les nodes disponibles
+        run: |
+          READY=$(kubectl get nodes \
+            --field-selector=status.conditions[?(@.type=Ready)].status=True \
+            --no-headers 2>/dev/null | wc -l || echo "0")
+          echo "Nodes Ready : $READY"
+          if [ "$READY" -lt 1 ]; then
+            echo "❌ Aucun node Ready — vérifier le node group EKS"
+            exit 1
+          fi
+          echo "✅ $READY node(s) disponible(s)"
+
+      # ── Vérifier ArgoCD ───────────────────────────────────
+      - name: Vérifier si ArgoCD est déjà installé
+        id: check-argocd
+        run: |
+          if kubectl get namespace "$ARGOCD_NAMESPACE" &>/dev/null && \
+             kubectl get deployment argocd-server \
+               -n "$ARGOCD_NAMESPACE" &>/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ArgoCD déjà installé"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  ArgoCD absent — sera installé"
+          fi
+
+  # ============================================================
+  # JOB 2 — Infrastructure (EBS + StorageClass)
+  # ============================================================
+  infrastructure:
+    name: "⚙️ Infrastructure — EBS + StorageClass"
+    runs-on: ubuntu-latest
+    needs: preflight
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      # ── EBS CSI Driver ────────────────────────────────────
+      - name: Installer/Vérifier EBS CSI Driver
+        run: |
+          STATUS="${{ needs.preflight.outputs.ebs_status }}"
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "✅ EBS CSI Driver déjà ACTIVE — skip"
+          elif [ "$STATUS" = "CREATING" ]; then
+            echo "⏳ EBS CSI Driver en cours de création — attente..."
+          else
+            echo "=== Installation EBS CSI Driver ==="
+            # Supprimer si en erreur
+            aws eks delete-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION" 2>/dev/null || true
+            sleep 10
+            # Réinstaller sans service_account_role_arn (LabRole via node IAM)
+            aws eks create-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION"
+            echo "⏳ Attente activation EBS CSI Driver..."
+          fi
+
+          # Attendre ACTIVE (max 3 min)
+          for i in $(seq 1 18); do
+            STATUS=$(aws eks describe-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --region "$AWS_REGION" \
+              --query 'addon.status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+            echo "  [${i}/18] EBS CSI Driver : $STATUS"
+            [ "$STATUS" = "ACTIVE" ] && break
+            [ "$STATUS" = "CREATE_FAILED" ] && {
+              echo "❌ EBS CSI Driver CREATE_FAILED"
+              exit 1
+            }
+            sleep 10
+          done
+          echo "✅ EBS CSI Driver ACTIVE"
+
+      # ── StorageClass gp2-csi ──────────────────────────────
+      - name: Créer le StorageClass gp2-csi
+        run: |
+          # Retirer default de l'ancien gp2
+          kubectl patch storageclass gp2 \
+            -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}' \
+            2>/dev/null || true
+
+          # Créer gp2-csi avec le bon provisioner CSI
+          kubectl apply -f - <<EOF
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: gp2-csi
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: ebs.csi.aws.com
+          volumeBindingMode: WaitForFirstConsumer
+          reclaimPolicy: Retain
+          parameters:
+            type: gp2
+          EOF
+          echo "✅ StorageClass gp2-csi créé"
+          kubectl get storageclass
+
+  # ============================================================
+  # JOB 3 — Installation ArgoCD
+  # ============================================================
+  install-argocd:
+    name: "📦 Installer ArgoCD"
+    runs-on: ubuntu-latest
+    needs: [ preflight, infrastructure ]
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      # ── Installer ArgoCD ──────────────────────────────────
+      - name: Installer ArgoCD
+        run: |
+          ALREADY="${{ needs.preflight.outputs.argocd_installed }}"
+          REINSTALL="${{ github.event.inputs.reinstall_argocd }}"
+
+          if [ "$ALREADY" = "true" ] && [ "$REINSTALL" != "true" ]; then
+            echo "✅ ArgoCD déjà installé — skip (utiliser reinstall_argocd=true pour forcer)"
+          else
+            echo "=== Installation ArgoCD ($ARGOCD_VERSION) ==="
+            kubectl create namespace "$ARGOCD_NAMESPACE" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            # Installer le manifest officiel ArgoCD
+            if [ "$ARGOCD_VERSION" = "stable" ]; then
+              MANIFEST_URL="https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
+            else
+              MANIFEST_URL="https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
+            fi
+
+            kubectl apply -n "$ARGOCD_NAMESPACE" -f "$MANIFEST_URL"
+            echo "✅ ArgoCD installé"
+          fi
+
+      # ── Exposer ArgoCD via LoadBalancer ───────────────────
+      - name: Exposer ArgoCD via LoadBalancer
+        run: |
+          # Vérifier si le service LB existe déjà
+          LB_EXISTS=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" 2>/dev/null && echo "true" || echo "false")
+
+          if [ "$LB_EXISTS" = "false" ]; then
+            kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: argocd-server-lb
+            namespace: ${ARGOCD_NAMESPACE}
+          spec:
+            type: LoadBalancer
+            selector:
+              app.kubernetes.io/name: argocd-server
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8080
+              - name: https
+                port: 443
+                targetPort: 8080
+          EOF
+            echo "✅ Service LoadBalancer ArgoCD créé"
+          else
+            echo "✅ Service LoadBalancer ArgoCD déjà présent"
+          fi
+
+      # ── Attendre ArgoCD prêt ──────────────────────────────
+      - name: Attendre qu'ArgoCD soit prêt
+        run: |
+          echo "⏳ Attente ArgoCD server (max 5 min)..."
+          kubectl rollout status deployment/argocd-server \
+            -n "$ARGOCD_NAMESPACE" \
+            --timeout=300s
+          echo "✅ ArgoCD server Running"
+
+      # ── Récupérer le mot de passe initial ─────────────────
+      - name: Récupérer le mot de passe admin ArgoCD
+        run: |
+          echo "⏳ Attente génération du secret admin (30s)..."
+          sleep 30
+          ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  ArgoCD — Credentials                            ║"
+          echo "║  Username : admin                                ║"
+          echo "║  Password : $ARGOCD_PWD"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+          # URL du LoadBalancer ArgoCD
+          sleep 20
+          ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "En cours...")
+          echo "ArgoCD URL : http://$ARGOCD_URL"
+
+  # ============================================================
+  # JOB 4 — Créer l'Application ArgoCD
+  # ============================================================
+  argocd-app:
+    name: "🎯 Créer l'Application ArgoCD"
+    runs-on: ubuntu-latest
+    needs: [ preflight, infrastructure, install-argocd ]
+
+    steps:
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      # ── Installer argocd CLI ──────────────────────────────
+      - name: Installer argocd CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd version --client
+
+      # ── Login ArgoCD ──────────────────────────────────────
+      - name: Login ArgoCD
+        run: |
+          # Attendre que le LB soit provisionné
+          echo "⏳ Attente URL LoadBalancer ArgoCD (max 3 min)..."
+          for i in $(seq 1 18); do
+            ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+              -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            [ -n "$ARGOCD_URL" ] && break
+            echo "  [${i}/18] En attente..."
+            sleep 10
+          done
+
+          if [ -z "$ARGOCD_URL" ]; then
+            # Fallback : port-forward
+            echo "⚠️  LoadBalancer non disponible — utilisation port-forward"
+            kubectl port-forward svc/argocd-server -n "$ARGOCD_NAMESPACE" 8080:443 &
+            sleep 5
+            ARGOCD_URL="localhost:8080"
+          fi
+
+          # Récupérer le mot de passe
+          ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.data.password}' | base64 -d)
+
+          # Login
+          argocd login "$ARGOCD_URL" \
+            --username admin \
+            --password "$ARGOCD_PWD" \
+            --insecure \
+            --grpc-web
+          echo "ARGOCD_URL=$ARGOCD_URL" >> "$GITHUB_ENV"
+          echo "✅ Login ArgoCD OK"
+
+      # ── Créer le namespace cible ──────────────────────────
+      - name: Créer le namespace plateforme-electronique
+        run: |
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "✅ Namespace $NAMESPACE prêt"
+
+      # ── Créer l'Application ArgoCD ────────────────────────
+      - name: Créer / mettre à jour l'Application ArgoCD
+        run: |
+          # Vérifier si l'application existe déjà
+          APP_EXISTS=$(argocd app get "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure 2>/dev/null && echo "true" || echo "false")
+
+          if [ "$APP_EXISTS" = "true" ]; then
+            echo "✅ Application '$ARGOCD_APP_NAME' existe déjà — mise à jour"
+            argocd app set "$ARGOCD_APP_NAME" \
+              --repo "$REPO_URL" \
+              --revision "$REPO_BRANCH" \
+              --dest-server https://kubernetes.default.svc \
+              --dest-namespace "$NAMESPACE" \
+              --server "$ARGOCD_URL" \
+              --insecure
+          else
+            echo "=== Création Application ArgoCD ==="
+            kubectl apply -f - <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${ARGOCD_APP_NAME}
+            namespace: ${ARGOCD_NAMESPACE}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: ${REPO_BRANCH}
+              directory:
+                recurse: true
+                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/**/*.yaml'
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${NAMESPACE}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+                - ApplyOutOfSyncOnly=true
+              retry:
+                limit: 5
+                backoff:
+                  duration: 10s
+                  factor: 2
+                  maxDuration: 3m
+          EOF
+            echo "✅ Application ArgoCD créée"
+          fi
+
+      # ── Synchroniser ──────────────────────────────────────
+      - name: Synchroniser l'application ArgoCD
+        run: |
+          echo "=== Synchronisation ArgoCD ==="
+          argocd app sync "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" \
+            --insecure \
+            --timeout 300 \
+            --retry-limit 3 || true
+          echo "✅ Synchronisation lancée"
+
+      # ── Attendre la santé ─────────────────────────────────
+      - name: Attendre que l'application soit Healthy
+        run: |
+          echo "⏳ Attente santé de l'application (max 10 min)..."
+          argocd app wait "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" \
+            --insecure \
+            --health \
+            --timeout 600 \
+          && echo "✅ Application Healthy" \
+          || echo "⚠️  Timeout — vérifier dans l'UI ArgoCD"
+
+      # ── Résumé final ──────────────────────────────────────
+      - name: "✅ Résumé — URLs d'accès"
+        if: always()
+        run: |
+          # URL ArgoCD
+          ARGOCD_LB=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "N/A")
+
+          # URL App Gateway
+          APP_LB=$(kubectl get svc api-gateway-lb \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "N/A")
+
+          # IP Nodes
+          NODE1=$(kubectl get nodes \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
+          NODE2=$(kubectl get nodes \
+            -o jsonpath='{.items[1].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  ACCÈS À LA PLATEFORME                                   ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  ArgoCD UI  → http://$ARGOCD_LB"
+          echo "║  ArgoCD     → admin / (voir logs 'Récupérer mot de passe')"
+          echo "║  API GW LB  → http://$APP_LB:8080"
+          echo "║  Frontend   → http://$NODE1:30180"
+          echo "║  Keycloak   → http://$NODE1:30881"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "=== État ArgoCD ==="
+          argocd app get "$ARGOCD_APP_NAME" \
+            --server "$ARGOCD_URL" --insecure 2>/dev/null || true
+          echo ""
+          echo "=== Pods ==="
+          kubectl get pods -n "$NAMESPACE" -o wide || true

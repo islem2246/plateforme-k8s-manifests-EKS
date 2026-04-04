@@ -1,0 +1,9 @@
+cd ~/plateforme-k8s-manifests-EKS/terraform
+
+# Désinstaller le Helm d'abord
+helm uninstall aws-ebs-csi-driver -n kube-system 2>/dev/null
+
+terraform init -upgrade
+terraform import aws_eks_cluster.main plateforme-paiement-eks
+terraform import aws_eks_node_group.workers "plateforme-paiement-eks:workers"
+terraform plan -var="aws_region=us-east-1" -var="cluster_name=plateforme-paiement-eks"

@@ -1,0 +1,274 @@
+# ============================================================
+# deploy.yml — Déploiement Plateforme Électronique v12
+# Déclenchement : push sur main + manuel
+# ============================================================
+# Si le cluster EKS n'existe pas, déclenche terraform.yml
+# automatiquement puis continue le déploiement.
+# ============================================================
+
+name: "🚢 Deploy Plateforme v12"
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - 'terraform/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run (aperçu sans appliquer)'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: plateforme-paiement-eks
+  NAMESPACE: plateforme-electronique
+
+permissions:
+  contents: read
+  actions: write          # nécessaire pour déclencher terraform.yml
+
+jobs:
+  # ============================================================
+  # JOB 1 — Vérifier le cluster, créer si absent
+  # ============================================================
+  ensure-cluster:
+    name: "🔎 Vérifier / Créer le cluster EKS"
+    runs-on: ubuntu-latest
+
+    outputs:
+      cluster_status: ${{ steps.check.outputs.status }}
+      cluster_created: ${{ steps.check.outputs.created }}
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Vérifier le statut du cluster EKS
+        id: check
+        run: |
+          STATUS=$(aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query 'cluster.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "📡 Statut du cluster : $STATUS"
+
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "✅ Cluster ACTIVE — pas besoin de le créer"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️  Cluster non disponible ($STATUS) — lancement de Terraform"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Déclencher terraform.yml si le cluster n'existe pas ──
+      - name: Déclencher le workflow Terraform (apply)
+        if: steps.check.outputs.status != 'ACTIVE'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const result = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'terraform.yml',
+              ref: context.ref,
+              inputs: { action: 'apply' }
+            });
+            console.log('🚀 Workflow Terraform déclenché');
+
+      # ── Attendre que le cluster devienne ACTIVE ──────────────
+      - name: Attendre que le cluster EKS soit ACTIVE (max 20 min)
+        if: steps.check.outputs.status != 'ACTIVE'
+        run: |
+          echo "⏳ Attente du cluster EKS..."
+          MAX_ATTEMPTS=40        # 40 × 30s = 20 minutes
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            STATUS=$(aws eks describe-cluster \
+              --name "$EKS_CLUSTER_NAME" \
+              --region "$AWS_REGION" \
+              --query 'cluster.status' \
+              --output text 2>/dev/null || echo "NOT_FOUND")
+
+            echo "  [$ATTEMPT/$MAX_ATTEMPTS] Statut : $STATUS"
+
+            if [ "$STATUS" = "ACTIVE" ]; then
+              echo "✅ Cluster ACTIVE après $((ATTEMPT * 30)) secondes"
+              exit 0
+            fi
+
+            sleep 30
+          done
+
+          echo "❌ Timeout — le cluster n'est pas devenu ACTIVE en 20 minutes"
+          exit 1
+
+  # ============================================================
+  # JOB 2 — Validation des manifests YAML
+  # ============================================================
+  validate-manifests:
+    name: "🔍 Validate Manifests"
+    runs-on: ubuntu-latest
+    needs: ensure-cluster
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer yamllint
+        run: pip install yamllint --quiet
+
+      - name: Valider tous les dossiers
+        run: |
+          for DIR in 00-namespace 01-secrets-configmaps 02-infrastructure \
+                     03-gateway 04-services 05-frontend 06-ingress \
+                     07-keycloak-realm 08-post-deploy; do
+            if [ -d "$DIR" ]; then
+              echo "📁 $DIR"
+              find "$DIR" -name "*.yaml" -o -name "*.yml" | sort | while read f; do
+                yamllint -d relaxed "$f" && echo "  ✅ $f" || echo "  ⚠️  $f"
+              done
+            else
+              echo "  ⚠️  Dossier absent : $DIR"
+            fi
+          done
+
+  # ============================================================
+  # JOB 3 — Déploiement (miroir exact de deploy.sh v12)
+  # ============================================================
+  deploy:
+    name: "🚢 Deploy Plateforme v12"
+    runs-on: ubuntu-latest
+    needs: [ ensure-cluster, validate-manifests ]
+    environment: production
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configurer les credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurer kubectl pour EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: "[DRY-RUN] Aperçu des manifests"
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          for DIR in 00-namespace 01-secrets-configmaps 02-infrastructure \
+                     03-gateway 04-services 05-frontend 06-ingress \
+                     07-keycloak-realm 08-post-deploy; do
+            [ -d "$DIR" ] && kubectl apply --dry-run=server -R -f "$DIR/" || true
+          done
+
+      # ── Étapes deploy.sh v12 ────────────────────────────
+      - name: "[1/8] Namespace"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 00-namespace/
+
+      - name: "[2/8] Secrets et ConfigMaps"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 01-secrets-configmaps/
+
+      - name: "[3/8] Infrastructure — PostgreSQL, Redis, Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 02-infrastructure/
+
+      - name: "[3/8] ⏳ Attente PostgreSQL (120s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=postgres --timeout=120s \
+          && echo "✅ PostgreSQL prêt" || echo "⚠️  Timeout PostgreSQL"
+
+      - name: "[3/8] ⏳ Attente Redis (90s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=redis --timeout=90s \
+          && echo "✅ Redis prêt" || echo "⚠️  Timeout Redis"
+
+      - name: "[3/8] ⏳ Attente Keycloak (300s)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=keycloak --timeout=300s \
+          && echo "✅ Keycloak prêt" || echo "⚠️  Timeout Keycloak"
+
+      - name: "[4/8] API Gateway"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 03-gateway/
+
+      - name: "[5/8] Microservices métier"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: kubectl apply -f 04-services/
+
+      - name: "[6/8] Frontend et Ingress"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 05-frontend/
+          kubectl apply -f 06-ingress/
+
+      - name: "[7/8] Import realm Keycloak"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f 07-keycloak-realm/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/keycloak-realm-import \
+            --timeout=180s \
+          && echo "✅ Realm importé" || echo "⚠️  Timeout realm"
+
+      - name: "[8/8] Seed users"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl delete job seed-users -n "$NAMESPACE" --ignore-not-found=true
+          kubectl apply -f 08-post-deploy/
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete job/seed-users \
+            --timeout=120s \
+          && echo "✅ Utilisateurs créés" || echo "⚠️  Timeout seed-users"
+
+      # ── Résumé ─────────────────────────────────────────
+      - name: "✅ État final"
+        if: always()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          echo "=== Services ==="
+          kubectl get services -n "$NAMESPACE" || true
+          echo "=== Jobs ==="
+          kubectl get jobs -n "$NAMESPACE" || true
+
+      - name: "🔴 Debug si échec"
+        if: failure()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by='.lastTimestamp' | tail -30 || true

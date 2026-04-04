@@ -1,0 +1,2 @@
+./restore-db.sh ./backups/20260305_143000
+./restore-db.sh ./backups/20260305_172402

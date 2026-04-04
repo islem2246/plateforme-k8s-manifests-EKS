@@ -1,0 +1,1 @@
+postgres.plateforme-electronique.svc.cluster.local
