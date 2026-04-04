@@ -1,88 +1,24 @@
-# ============================================================
-# Terraform — Cluster EKS pour Plateforme Électronique v12
-# Compte AWS : 554813750145  |  Région : us-east-1
-#
-# ⚠️  AWS Academy : iam:CreateRole est interdit.
-#     Utilise exclusivement LabRole (pré-existant).
-#
-# FIX v5 :
-#   - OIDC provider pour EBS CSI Driver
-#   - bootstrap_self_managed_addons = false (évite destroy du cluster)
-# ============================================================
-
 terraform {
   required_version = ">= 1.7.0"
-
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.40"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
   }
 }
 
-# ============================================================
-# Variables
-# ============================================================
+variable "aws_region"         { default = "us-east-1" }
+variable "cluster_name"       { default = "plateforme-paiement-eks" }
+variable "cluster_version"    { default = "1.34" }
+variable "node_instance_type" { default = "t3.medium" }
+variable "node_desired"       { default = 2 }
+variable "node_min"           { default = 1 }
+variable "node_max"           { default = 3 }
 
-variable "aws_region" {
-  description = "Région AWS"
-  type        = string
-  default     = "us-east-1"
-}
+provider "aws" { region = var.aws_region }
 
-variable "cluster_name" {
-  description = "Nom du cluster EKS"
-  type        = string
-  default     = "plateforme-paiement-eks"
-}
-
-variable "cluster_version" {
-  description = "Version de Kubernetes"
-  type        = string
-  default     = "1.34"
-}
-
-variable "node_instance_type" {
-  description = "Type d'instance EC2 pour les workers"
-  type        = string
-  default     = "t3.medium"
-}
-
-variable "node_desired" {
-  type    = number
-  default = 2
-}
-
-variable "node_min" {
-  type    = number
-  default = 1
-}
-
-variable "node_max" {
-  type    = number
-  default = 3
-}
-
-# ============================================================
-# Provider AWS
-# ============================================================
-
-provider "aws" {
-  region = var.aws_region
-}
-
-# ============================================================
-# Données existantes
-# ============================================================
-
-data "aws_vpc" "default" {
-  default = true
-}
+data "aws_vpc" "default" { default = true }
 
 data "aws_subnets" "all" {
   filter {
@@ -96,17 +32,10 @@ data "aws_subnet" "details" {
   id       = each.value
 }
 
-data "aws_iam_role" "lab_role" {
-  name = "LabRole"
-}
-
-# ============================================================
-# Locals — filtrage des AZ non supportées par EKS
-# ============================================================
+data "aws_iam_role" "lab_role" { name = "LabRole" }
 
 locals {
-  excluded_azs = ["us-east-1e"]
-
+  excluded_azs   = ["us-east-1e"]
   eks_subnet_ids = [
     for subnet in data.aws_subnet.details :
     subnet.id
@@ -114,18 +43,10 @@ locals {
   ]
 }
 
-# ============================================================
-# Cluster EKS
-# ============================================================
-
 resource "aws_eks_cluster" "main" {
-  name    = var.cluster_name
-  version = var.cluster_version
-
+  name     = var.cluster_name
+  version  = var.cluster_version
   role_arn = data.aws_iam_role.lab_role.arn
-
-  # Empêche Terraform de détruire/recréer le cluster lors d'un import
-  bootstrap_self_managed_addons = false
 
   vpc_config {
     subnet_ids              = local.eks_subnet_ids
@@ -134,42 +55,8 @@ resource "aws_eks_cluster" "main" {
     public_access_cidrs     = ["0.0.0.0/0"]
   }
 
-  tags = {
-    Project     = "plateforme-electronique-paiement"
-    ManagedBy   = "terraform"
-  }
-
-  timeouts {
-    create = "25m"
-    update = "25m"
-    delete = "25m"
-  }
+  timeouts { create = "25m"; update = "25m"; delete = "25m" }
 }
-
-# ============================================================
-# OIDC Provider — nécessaire pour EBS CSI Driver
-# Sans OIDC, le CSI controller ne peut pas s'authentifier
-# via AssumeRoleWithWebIdentity et crashe en boucle
-# ============================================================
-
-data "tls_certificate" "eks" {
-  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
-}
-
-resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
-
-  tags = {
-    Project   = "plateforme-electronique-paiement"
-    ManagedBy = "terraform"
-  }
-}
-
-# ============================================================
-# Node Group (workers)
-# ============================================================
 
 resource "aws_eks_node_group" "workers" {
   cluster_name    = aws_eks_cluster.main.name
@@ -184,31 +71,12 @@ resource "aws_eks_node_group" "workers" {
     max_size     = var.node_max
   }
 
-  update_config {
-    max_unavailable = 1
-  }
+  update_config { max_unavailable = 1 }
 
-  tags = {
-    Project   = "plateforme-electronique-paiement"
-    ManagedBy = "terraform"
-  }
-
-  timeouts {
-    create = "25m"
-    update = "25m"
-    delete = "25m"
-  }
-
-  lifecycle {
-    ignore_changes = [scaling_config[0].desired_size]
-  }
-
+  lifecycle { ignore_changes = [scaling_config[0].desired_size] }
   depends_on = [aws_eks_cluster.main]
+  timeouts { create = "25m"; update = "25m"; delete = "25m" }
 }
-
-# ============================================================
-# Addons EKS
-# ============================================================
 
 resource "aws_eks_addon" "vpc_cni" {
   cluster_name                = aws_eks_cluster.main.name
@@ -234,49 +102,37 @@ resource "aws_eks_addon" "kube_proxy" {
   depends_on                  = [aws_eks_node_group.workers]
 }
 
-# EBS CSI Driver — dépend de l'OIDC provider pour s'authentifier
 resource "aws_eks_addon" "ebs_csi" {
   cluster_name                = aws_eks_cluster.main.name
   addon_name                  = "aws-ebs-csi-driver"
   service_account_role_arn    = data.aws_iam_role.lab_role.arn
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
-  depends_on = [
-    aws_eks_node_group.workers,
-    aws_iam_openid_connect_provider.eks
-  ]
+  depends_on                  = [aws_eks_node_group.workers]
 }
 
-# ============================================================
-# Outputs
-# ============================================================
-
-output "cluster_name" {
-  value = aws_eks_cluster.main.name
+# StorageClass gp3 — default
+resource "kubernetes_storage_class" "gp3" {
+  metadata {
+    name = "gp3"
+    annotations = {
+      "storageclass.kubernetes.io/is-default-class" = "true"
+    }
+  }
+  storage_provisioner    = "ebs.csi.aws.com"
+  volume_binding_mode    = "WaitForFirstConsumer"
+  allow_volume_expansion = true
+  parameters = {
+    type      = "gp3"
+    fsType    = "ext4"
+    encrypted = "false"
+  }
+  depends_on = [aws_eks_addon.ebs_csi]
 }
 
-output "cluster_endpoint" {
-  value = aws_eks_cluster.main.endpoint
-}
-
-output "cluster_status" {
-  value = aws_eks_cluster.main.status
-}
-
-output "eks_subnet_ids" {
-  description = "Subnets utilisés par EKS (us-east-1e exclu)"
-  value       = local.eks_subnet_ids
-}
-
-output "kubeconfig_command" {
-  value = "aws eks update-kubeconfig --region ${var.aws_region} --name ${aws_eks_cluster.main.name}"
-}
-
-output "node_group_status" {
-  value = aws_eks_node_group.workers.status
-}
-
-output "oidc_provider_arn" {
-  description = "ARN de l'OIDC provider (nécessaire pour EBS CSI)"
-  value       = aws_iam_openid_connect_provider.eks.arn
-}
+output "cluster_name"       { value = aws_eks_cluster.main.name }
+output "cluster_endpoint"   { value = aws_eks_cluster.main.endpoint }
+output "cluster_status"     { value = aws_eks_cluster.main.status }
+output "eks_subnet_ids"     { value = local.eks_subnet_ids }
+output "kubeconfig_command" { value = "aws eks update-kubeconfig --region ${var.aws_region} --name ${aws_eks_cluster.main.name}" }
+output "node_group_status"  { value = aws_eks_node_group.workers.status }
