@@ -1,5 +1,5 @@
 # ============================================================
-# terraform.yml — Création / Destruction du cluster EKS 04/04/2026
+# terraform.yml — Création / Destruction du cluster EKS
 # Déclenchement : MANUEL UNIQUEMENT (workflow_dispatch)
 # ============================================================
 
@@ -94,142 +94,11 @@ jobs:
         env:
           TF_LOG: WARN
 
-      # ── Filet de sécurité : vérifier et installer les addons ─────
-      - name: Vérifier et installer les addons EKS
-        if: github.event.inputs.action == 'apply'
-        run: |
-          echo "=== Vérification des addons EKS ==="
-
-          # Attendre que le cluster soit bien ACTIVE
-          for i in $(seq 1 10); do
-            STATUS=$(aws eks describe-cluster \
-              --name "$EKS_CLUSTER_NAME" \
-              --region "$AWS_REGION" \
-              --query 'cluster.status' \
-              --output text 2>/dev/null || echo "NOT_FOUND")
-            if [ "$STATUS" = "ACTIVE" ]; then
-              echo "✅ Cluster ACTIVE"
-              break
-            fi
-            echo "  ⏳ Attente cluster ACTIVE... ($i/10)"
-            sleep 30
-          done
-
-          ADDONS=$(aws eks list-addons \
-            --cluster-name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION" \
-            --query 'addons[]' --output text 2>/dev/null || echo "")
-
-          echo "Addons actuels : $ADDONS"
-
-          # Addons de base
-          for ADDON in vpc-cni coredns kube-proxy; do
-            if echo "$ADDONS" | grep -q "$ADDON"; then
-              echo "✅ $ADDON déjà installé"
-            else
-              echo "📦 Installation de $ADDON..."
-              aws eks create-addon \
-                --cluster-name "$EKS_CLUSTER_NAME" \
-                --addon-name "$ADDON" \
-                --resolve-conflicts OVERWRITE \
-                --region "$AWS_REGION"
-              echo "  ✅ $ADDON créé"
-            fi
-          done
-
-          # EBS CSI Driver avec LabRole
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          if echo "$ADDONS" | grep -q "aws-ebs-csi-driver"; then
-            echo "✅ aws-ebs-csi-driver déjà installé"
-          else
-            echo "📦 Installation de aws-ebs-csi-driver..."
-            aws eks create-addon \
-              --cluster-name "$EKS_CLUSTER_NAME" \
-              --addon-name aws-ebs-csi-driver \
-              --service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/LabRole" \
-              --resolve-conflicts OVERWRITE \
-              --region "$AWS_REGION"
-            echo "  ✅ aws-ebs-csi-driver créé"
-          fi
-
-          echo ""
-          echo "⏳ Attente activation des addons (90s)..."
-          sleep 90
-
-          echo "=== Statut des addons ==="
-          for ADDON in vpc-cni coredns kube-proxy aws-ebs-csi-driver; do
-            ADDON_STATUS=$(aws eks describe-addon \
-              --cluster-name "$EKS_CLUSTER_NAME" \
-              --addon-name "$ADDON" \
-              --region "$AWS_REGION" \
-              --query 'addon.status' \
-              --output text 2>/dev/null || echo "NOT_FOUND")
-            echo "  $ADDON : $ADDON_STATUS"
-          done
-
-          echo "✅ Addons vérifiés"
-        working-directory: .
-
-      # ── Vérifier que les nodes sont Ready ────────────────────────
-      - name: Attendre les nodes Ready
-        if: github.event.inputs.action == 'apply'
-        run: |
-          aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
-
-          echo "⏳ Attente des nodes Ready (max 5 min)..."
-          for i in $(seq 1 30); do
-            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c "Ready" || echo "0")
-            TOTAL=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-            echo "  [$i/30] Nodes Ready: $READY / $TOTAL"
-            if [ "$READY" -ge 2 ]; then
-              echo "✅ $READY nodes Ready"
-              kubectl get nodes -o wide
-              break
-            fi
-            sleep 10
-          done
-        working-directory: .
-
-      # ── Créer la StorageClass gp3 par défaut ─────────────────────
-      - name: Créer StorageClass gp3
-        if: github.event.inputs.action == 'apply'
-        run: |
-          aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
-
-          # Retirer le default de gp2 si présent
-          kubectl annotate storageclass gp2 \
-            storageclass.kubernetes.io/is-default-class=false \
-            --overwrite 2>/dev/null || true
-
-          # Créer gp3 comme default
-          kubectl apply -f - <<'EOF'
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata:
-            name: gp3
-            annotations:
-              storageclass.kubernetes.io/is-default-class: "true"
-          provisioner: ebs.csi.aws.com
-          volumeBindingMode: WaitForFirstConsumer
-          allowVolumeExpansion: true
-          parameters:
-            type: gp3
-            fsType: ext4
-            encrypted: "false"
-          EOF
-
-          echo "✅ StorageClass gp3 créée comme default"
-          kubectl get storageclass
-        working-directory: .
-
       # ============================================================
       # DESTROY — Nettoyage K8s puis destruction Terraform
       # ============================================================
 
+      # ── Étape 1 : Configurer kubectl ─────────────────────────────
       - name: "[Destroy 1/5] Configurer kubectl"
         if: github.event.inputs.action == 'destroy'
         run: |
@@ -240,6 +109,7 @@ jobs:
           || echo "⚠️  Cluster inaccessible — poursuite quand même"
         working-directory: .
 
+      # ── Étape 2 : Supprimer les Services LoadBalancer ────────────
       - name: "[Destroy 2/5] Supprimer les LoadBalancers"
         if: github.event.inputs.action == 'destroy'
         run: |
@@ -256,6 +126,7 @@ jobs:
           echo "✅ LoadBalancers supprimés"
         working-directory: .
 
+      # ── Étape 3 : Supprimer les PVCs ─────────────────────────────
       - name: "[Destroy 3/5] Supprimer les PVCs et PVs"
         if: github.event.inputs.action == 'destroy'
         run: |
@@ -276,6 +147,7 @@ jobs:
           echo "✅ PVCs et PVs supprimés"
         working-directory: .
 
+      # ── Étape 4 : Supprimer le namespace entier ──────────────────
       - name: "[Destroy 4/5] Supprimer le namespace"
         if: github.event.inputs.action == 'destroy'
         run: |
@@ -284,35 +156,23 @@ jobs:
           echo "✅ Namespace supprimé"
         working-directory: .
 
+      # ── Étape 5 : Terraform destroy ──────────────────────────────
       - name: "[Destroy 5/5] Terraform Destroy"
         if: github.event.inputs.action == 'destroy'
         run: |
           echo "=== Import des ressources dans l'état Terraform ==="
 
+          # Importer le cluster
           terraform import \
             -var="aws_region=$AWS_REGION" \
             -var="cluster_name=$EKS_CLUSTER_NAME" \
             aws_eks_cluster.main "$EKS_CLUSTER_NAME" 2>/dev/null || true
 
+          # Importer le node group
           terraform import \
             -var="aws_region=$AWS_REGION" \
             -var="cluster_name=$EKS_CLUSTER_NAME" \
             aws_eks_node_group.workers "$EKS_CLUSTER_NAME:workers" 2>/dev/null || true
-
-          # Importer l'OIDC provider
-          OIDC_ID=$(aws eks describe-cluster \
-            --name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION" \
-            --query 'cluster.identity.oidc.issuer' \
-            --output text 2>/dev/null | sed 's|https://||')
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          if [ -n "$OIDC_ID" ] && [ "$OIDC_ID" != "None" ]; then
-            terraform import \
-              -var="aws_region=$AWS_REGION" \
-              -var="cluster_name=$EKS_CLUSTER_NAME" \
-              aws_iam_openid_connect_provider.eks \
-              "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_ID}" 2>/dev/null || true
-          fi
 
           # Importer les addons
           declare -A ADDON_MAP=(
