@@ -1,40 +1,27 @@
-name: 🔭 Monitoring — Prometheus & Grafana (Amazon Managed)
+name: "Monitoring Prometheus Grafana"
 
 on:
   workflow_run:
-    workflows: ["Deploy Plateforme v12"]
+    workflows: ["🚢 Deploy Plateforme v12"]
     types:
       - completed
-
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Action'
-        required: true
-        default: 'install'
-        type: choice
-        options:
-          - install
-          - uninstall
-          - status
 
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: plateforme-paiement-eks
-  NAMESPACE: plateforme-electronique
   MONITORING_NAMESPACE: monitoring
 
 jobs:
   monitoring:
-    name: 📊 Setup Monitoring Stack
+    name: "Prometheus + Grafana"
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
-
     steps:
-      - name: 📥 Checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🔐 Configure AWS credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -42,107 +29,41 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: ☸️ Configure kubectl
+      - name: Configure kubectl
         run: |
-          aws eks update-kubeconfig \
-            --region ${{ env.AWS_REGION }} \
-            --name ${{ env.CLUSTER_NAME }}
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
           kubectl get nodes
 
-      - name: 📦 Installer Helm
+      - name: Installer Helm
         uses: azure/setup-helm@v3
         with:
-          version: 'v3.14.0'
+          version: v3.14.0
 
-      - name: 🔭 [1/4] Créer namespace monitoring
+      - name: Creer namespace monitoring
         run: |
-          kubectl create namespace ${{ env.MONITORING_NAMESPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace ${{ env.MONITORING_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: 📊 [2/4] Installer Prometheus (kube-prometheus-stack)
+      - name: Installer Prometheus et Grafana
         run: |
-          helm repo add prometheus-community \
-            https://prometheus-community.github.io/helm-charts
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack             --namespace ${{ env.MONITORING_NAMESPACE }}             --set grafana.adminPassword=admin123             --set grafana.service.type=LoadBalancer             --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false             --set alertmanager.enabled=false             --set nodeExporter.enabled=true             --set kubeStateMetrics.enabled=true             --timeout 10m             --wait
 
-          helm upgrade --install prometheus \
-            prometheus-community/kube-prometheus-stack \
-            --namespace ${{ env.MONITORING_NAMESPACE }} \
-            --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-            --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
-            --set grafana.enabled=true \
-            --set grafana.adminPassword=admin123 \
-            --set grafana.service.type=NodePort \
-            --set grafana.service.nodePort=32000 \
-            --set prometheus.service.type=NodePort \
-            --set prometheus.service.nodePort=32001 \
-            --set alertmanager.enabled=false \
-            --set nodeExporter.enabled=true \
-            --set kubeStateMetrics.enabled=true \
-            --timeout 10m \
-            --wait
-
-      - name: 📡 [3/4] Créer ServiceMonitor pour les microservices
+      - name: Attendre URL ELB Grafana
         run: |
-          kubectl apply -f - <<YAML
-          apiVersion: monitoring.coreos.com/v1
-          kind: ServiceMonitor
-          metadata:
-            name: plateforme-microservices
-            namespace: ${{ env.MONITORING_NAMESPACE }}
-            labels:
-              release: prometheus
-          spec:
-            namespaceSelector:
-              matchNames:
-                - ${{ env.NAMESPACE }}
-            selector:
-              matchLabels: {}
-            endpoints:
-              - port: http
-                path: /actuator/prometheus
-                interval: 30s
-          YAML
+          for i in $(seq 1 20); do
+            GRAFANA_URL=$(kubectl get svc prometheus-grafana -n ${{ env.MONITORING_NAMESPACE }} -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" 2>/dev/null)
+            if [ -n "$GRAFANA_URL" ]; then
+              echo "Grafana URL: http://$GRAFANA_URL"
+              break
+            fi
+            echo "Attente... $i/20"
+            sleep 15
+          done
 
-      - name: 🌐 [4/4] Ouvrir les ports Grafana et Prometheus
+      - name: Resume final
         run: |
-          # Récupérer le Security Group
-          SG=$(aws ec2 describe-instances \
-            --filters "Name=tag:eks:cluster-name,Values=${{ env.CLUSTER_NAME }}" \
-            --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
-            --output text --region ${{ env.AWS_REGION }})
-
-          echo "Security Group: $SG"
-
-          # Ouvrir port Grafana
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SG \
-            --protocol tcp \
-            --port 32000 \
-            --cidr 0.0.0.0/0 \
-            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Port 32000 déjà ouvert"
-
-          # Ouvrir port Prometheus
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SG \
-            --protocol tcp \
-            --port 32001 \
-            --cidr 0.0.0.0/0 \
-            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Port 32001 déjà ouvert"
-
-      - name: ✅ Résumé
-        run: |
-          echo "=== Pods Monitoring ==="
           kubectl get pods -n ${{ env.MONITORING_NAMESPACE }}
-
-          echo ""
-          echo "=== Services ==="
-          kubectl get svc -n ${{ env.MONITORING_NAMESPACE }}
-
-          echo ""
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
-          echo "================================================"
-          echo "🌐 Grafana    → http://$NODE_IP:32000"
-          echo "   Login      → admin / admin123"
-          echo "📊 Prometheus → http://$NODE_IP:32001"
-          echo "================================================"
+          GRAFANA_URL=$(kubectl get svc prometheus-grafana -n ${{ env.MONITORING_NAMESPACE }} -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+          echo "Grafana: http://$GRAFANA_URL"
+          echo "Login: admin / admin123"
