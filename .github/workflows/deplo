@@ -357,10 +357,9 @@ jobs:
             source:
               repoURL: ${{ env.REPO_URL }}
               targetRevision: ${{ env.REPO_BRANCH }}
-              path: "."
               directory:
                 recurse: true
-                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/*.yaml'
+                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/**/*.yaml'
             destination:
               server: https://kubernetes.default.svc
               namespace: ${{ env.NAMESPACE }}
