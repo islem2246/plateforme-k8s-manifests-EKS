@@ -25,6 +25,10 @@ env:
   AWS_REGION: us-east-1
   EKS_CLUSTER_NAME: plateforme-paiement-eks
   NAMESPACE: plateforme-electronique
+  ARGOCD_NAMESPACE: argocd
+  ARGOCD_APP_NAME: plateforme-electronique
+  REPO_URL: https://github.com/islem2246/plateforme-k8s-manifests-EKS
+  REPO_BRANCH: main
 
 permissions:
   contents: read
@@ -74,7 +78,6 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Déclencher terraform.yml si le cluster n'existe pas ──
       - name: Déclencher le workflow Terraform (apply)
         if: steps.check.outputs.status != 'ACTIVE'
         uses: actions/github-script@v7
@@ -90,17 +93,15 @@ jobs:
             });
             console.log('🚀 Workflow Terraform déclenché');
 
-      # ── Attendre que le cluster devienne ACTIVE ──────────────
       - name: Attendre que le cluster EKS soit ACTIVE (max 20 min)
         if: steps.check.outputs.status != 'ACTIVE'
         run: |
           echo "⏳ Attente du cluster EKS..."
-          MAX_ATTEMPTS=40        # 40 × 30s = 20 minutes
+          MAX_ATTEMPTS=40
           ATTEMPT=0
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
-
             STATUS=$(aws eks describe-cluster \
               --name "$EKS_CLUSTER_NAME" \
               --region "$AWS_REGION" \
@@ -108,16 +109,11 @@ jobs:
               --output text 2>/dev/null || echo "NOT_FOUND")
 
             echo "  [$ATTEMPT/$MAX_ATTEMPTS] Statut : $STATUS"
-
-            if [ "$STATUS" = "ACTIVE" ]; then
-              echo "✅ Cluster ACTIVE après $((ATTEMPT * 30)) secondes"
-              exit 0
-            fi
-
+            [ "$STATUS" = "ACTIVE" ] && echo "✅ Cluster ACTIVE" && exit 0
             sleep 30
           done
 
-          echo "❌ Timeout — le cluster n'est pas devenu ACTIVE en 20 minutes"
+          echo "❌ Timeout — cluster non ACTIVE en 20 minutes"
           exit 1
 
   # ============================================================
@@ -151,10 +147,10 @@ jobs:
           done
 
   # ============================================================
-  # JOB 3 — Déploiement (miroir exact de deploy.sh v12)
+  # JOB 3 — Déploiement + ArgoCD GitOps
   # ============================================================
   deploy:
-    name: "🚢 Deploy Plateforme v12"
+    name: "🚢 Deploy Plateforme v12 + ArgoCD"
     runs-on: ubuntu-latest
     needs: [ ensure-cluster, validate-manifests ]
     environment: production
@@ -188,7 +184,7 @@ jobs:
             [ -d "$DIR" ] && kubectl apply --dry-run=server -R -f "$DIR/" || true
           done
 
-      # ── Étapes deploy.sh v12 ────────────────────────────
+      # ── Étapes deploy classique ─────────────────────────
       - name: "[1/8] Namespace"
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: kubectl apply -f 00-namespace/
@@ -255,12 +251,131 @@ jobs:
             --timeout=120s \
           && echo "✅ Utilisateurs créés" || echo "⚠️  Timeout seed-users"
 
-      # ── Résumé ─────────────────────────────────────────
+      # ============================================================
+      # ── ArgoCD — Installation + GitOps ──────────────────────────
+      # ============================================================
+
+      - name: "[ArgoCD 1/5] Installer ArgoCD (si absent)"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          if kubectl get namespace "$ARGOCD_NAMESPACE" &>/dev/null && \
+             kubectl get deployment argocd-server -n "$ARGOCD_NAMESPACE" &>/dev/null; then
+            echo "✅ ArgoCD déjà installé — skip"
+          else
+            echo "=== Installation ArgoCD (stable) ==="
+            kubectl create namespace "$ARGOCD_NAMESPACE" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -n "$ARGOCD_NAMESPACE" \
+              -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+            echo "✅ ArgoCD installé"
+          fi
+
+      - name: "[ArgoCD 2/5] Exposer ArgoCD via LoadBalancer"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: argocd-server-lb
+            namespace: ${{ env.ARGOCD_NAMESPACE }}
+          spec:
+            type: LoadBalancer
+            selector:
+              app.kubernetes.io/name: argocd-server
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8080
+              - name: https
+                port: 443
+                targetPort: 8080
+          EOF
+          echo "✅ Service LoadBalancer ArgoCD appliqué"
+
+      - name: "[ArgoCD 3/5] Attendre qu'ArgoCD soit prêt"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          echo "⏳ Attente argocd-server (max 5 min)..."
+          kubectl rollout status deployment/argocd-server \
+            -n "$ARGOCD_NAMESPACE" --timeout=300s
+          echo "✅ ArgoCD server Running"
+
+      - name: "[ArgoCD 4/5] Créer l'Application ArgoCD"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${{ env.ARGOCD_APP_NAME }}
+            namespace: ${{ env.ARGOCD_NAMESPACE }}
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: ${{ env.REPO_URL }}
+              targetRevision: ${{ env.REPO_BRANCH }}
+              directory:
+                recurse: true
+                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/**/*.yaml'
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: ${{ env.NAMESPACE }}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+                - ApplyOutOfSyncOnly=true
+              retry:
+                limit: 5
+                backoff:
+                  duration: 10s
+                  factor: 2
+                  maxDuration: 3m
+          EOF
+          echo "✅ Application ArgoCD créée / mise à jour"
+
+      - name: "[ArgoCD 5/5] Afficher mot de passe admin + URLs"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          # Attendre génération du secret
+          sleep 30
+          ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "secret-pas-encore-prêt")
+
+          # URL LoadBalancer ArgoCD
+          sleep 20
+          ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "En cours...")
+
+          # IP Nodes pour frontend/keycloak
+          NODE_IP=$(kubectl get nodes \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || echo "N/A")
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  ACCÈS À LA PLATEFORME                                   ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  ArgoCD UI  → http://$ARGOCD_URL"
+          echo "║  ArgoCD     → admin / $ARGOCD_PWD"
+          echo "║  Frontend   → http://$NODE_IP:30180"
+          echo "║  Keycloak   → http://$NODE_IP:30881"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+      # ── Résumé final ────────────────────────────────────
       - name: "✅ État final"
         if: always()
         run: |
-          echo "=== Pods ==="
+          echo "=== Pods plateforme ==="
           kubectl get pods -n "$NAMESPACE" -o wide || true
+          echo "=== Pods ArgoCD ==="
+          kubectl get pods -n "$ARGOCD_NAMESPACE" || true
           echo "=== Services ==="
           kubectl get services -n "$NAMESPACE" || true
           echo "=== Jobs ==="
