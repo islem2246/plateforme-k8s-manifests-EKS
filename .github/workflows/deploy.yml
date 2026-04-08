@@ -252,6 +252,45 @@ jobs:
           && echo "✅ Utilisateurs créés" || echo "⚠️  Timeout seed-users"
 
       # ============================================================
+      # ── Fix Postgres/Redis — emptyDir si PVC Pending ────────────
+      # ============================================================
+
+      - name: "[Fix] Patcher postgres/redis en emptyDir si PVC bloqués"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          # Vérifier si postgres est Pending (PVC bloqué)
+          PG_STATUS=$(kubectl get pod -n "$NAMESPACE" -l app=postgres \
+            --no-headers 2>/dev/null | awk '{print $3}' | head -1)
+          RD_STATUS=$(kubectl get pod -n "$NAMESPACE" -l app=redis \
+            --no-headers 2>/dev/null | awk '{print $3}' | head -1)
+
+          if [ "$PG_STATUS" = "Pending" ]; then
+            echo "⚠️  Postgres Pending — patch emptyDir"
+            kubectl delete pvc postgres-pvc -n "$NAMESPACE" --force 2>/dev/null || true
+            kubectl patch deployment postgres -n "$NAMESPACE" --type=json \
+              -p='[{"op":"replace","path":"/spec/template/spec/volumes/0","value":{"name":"postgres-storage","emptyDir":{}}}]'
+            kubectl rollout restart deployment/postgres -n "$NAMESPACE"
+          else
+            echo "✅ Postgres OK ($PG_STATUS)"
+          fi
+
+          if [ "$RD_STATUS" = "Pending" ]; then
+            echo "⚠️  Redis Pending — patch emptyDir"
+            kubectl delete pvc redis-pvc -n "$NAMESPACE" --force 2>/dev/null || true
+            kubectl patch deployment redis -n "$NAMESPACE" --type=json \
+              -p='[{"op":"replace","path":"/spec/template/spec/volumes/0","value":{"name":"redis-storage","emptyDir":{}}}]'
+            kubectl rollout restart deployment/redis -n "$NAMESPACE"
+          else
+            echo "✅ Redis OK ($RD_STATUS)"
+          fi
+
+          # Attendre qu'ils soient Ready
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=postgres --timeout=90s 2>/dev/null && echo "✅ Postgres prêt" || echo "⚠️  Timeout postgres"
+          kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+            -l app=redis --timeout=60s 2>/dev/null && echo "✅ Redis prêt" || echo "⚠️  Timeout redis"
+
+      # ============================================================
       # ── ArgoCD — Installation + GitOps ──────────────────────────
       # ============================================================
 
