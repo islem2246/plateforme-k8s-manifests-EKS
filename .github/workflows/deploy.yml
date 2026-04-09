@@ -415,6 +415,133 @@ jobs:
           echo "║  Keycloak   → http://$NODE_IP:30881"
           echo "╚══════════════════════════════════════════════════════════╝"
 
+      # ── Health Check ─────────────────────────────────────
+      - name: "🏥 Health Check — Vérifier les endpoints"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          NODE_IP=$(kubectl get nodes \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' \
+            2>/dev/null || echo "")
+
+          echo "=== Health Check des endpoints ==="
+
+          # Frontend
+          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 "http://$NODE_IP:30180" 2>/dev/null || echo "000")
+          if [ "$FRONTEND_STATUS" = "200" ] || [ "$FRONTEND_STATUS" = "301" ] || [ "$FRONTEND_STATUS" = "302" ]; then
+            echo "✅ Frontend → HTTP $FRONTEND_STATUS"
+            echo "FRONTEND_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  Frontend → HTTP $FRONTEND_STATUS"
+            echo "FRONTEND_OK=false" >> "$GITHUB_ENV"
+          fi
+
+          # Keycloak
+          KEYCLOAK_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 "http://$NODE_IP:30881" 2>/dev/null || echo "000")
+          if [ "$KEYCLOAK_STATUS" = "200" ] || [ "$KEYCLOAK_STATUS" = "301" ] || [ "$KEYCLOAK_STATUS" = "302" ]; then
+            echo "✅ Keycloak  → HTTP $KEYCLOAK_STATUS"
+            echo "KEYCLOAK_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  Keycloak  → HTTP $KEYCLOAK_STATUS"
+            echo "KEYCLOAK_OK=false" >> "$GITHUB_ENV"
+          fi
+
+          # API Gateway via LoadBalancer
+          API_LB=$(kubectl get svc api-gateway-lb -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 "http://$API_LB:8080/actuator/health" 2>/dev/null || echo "000")
+          if [ "$API_STATUS" = "200" ]; then
+            echo "✅ API Gateway → HTTP $API_STATUS"
+            echo "API_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  API Gateway → HTTP $API_STATUS (normal si pas d'endpoint /health)"
+            echo "API_OK=false" >> "$GITHUB_ENV"
+          fi
+
+          echo "NODE_IP=$NODE_IP" >> "$GITHUB_ENV"
+          echo "API_LB=$API_LB" >> "$GITHUB_ENV"
+
+      # ── ArgoCD Sync Status Check ─────────────────────────
+      - name: "🔄 ArgoCD Sync Status Check"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          echo "=== Vérification ArgoCD ==="
+
+          SYNC=$(kubectl get application "$ARGOCD_APP_NAME" \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+          HEALTH=$(kubectl get application "$ARGOCD_APP_NAME" \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+          REVISION=$(kubectl get application "$ARGOCD_APP_NAME" \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.sync.revision}' 2>/dev/null || echo "Unknown")
+
+          echo "Sync   : $SYNC"
+          echo "Health : $HEALTH"
+          echo "Commit : $REVISION"
+
+          if [ "$SYNC" = "Synced" ]; then
+            echo "✅ ArgoCD Synced"
+            echo "ARGOCD_SYNC=✅ Synced" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  ArgoCD $SYNC"
+            echo "ARGOCD_SYNC=⚠️ $SYNC" >> "$GITHUB_ENV"
+          fi
+
+          if [ "$HEALTH" = "Healthy" ]; then
+            echo "✅ ArgoCD Healthy"
+            echo "ARGOCD_HEALTH=✅ Healthy" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  ArgoCD $HEALTH"
+            echo "ARGOCD_HEALTH=⚠️ $HEALTH" >> "$GITHUB_ENV"
+          fi
+
+          # Compter les pods Running
+          RUNNING=$(kubectl get pods -n "$NAMESPACE" --no-headers \
+            2>/dev/null | grep -c "Running" || echo "0")
+          TOTAL=$(kubectl get pods -n "$NAMESPACE" --no-headers \
+            2>/dev/null | wc -l || echo "0")
+          echo "PODS_RUNNING=$RUNNING" >> "$GITHUB_ENV"
+          echo "PODS_TOTAL=$TOTAL" >> "$GITHUB_ENV"
+
+          ARGOCD_URL=$(kubectl get svc argocd-server-lb \
+            -n "$ARGOCD_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "N/A")
+          echo "ARGOCD_URL=$ARGOCD_URL" >> "$GITHUB_ENV"
+
+      # ── Job Summary visuel ───────────────────────────────
+      - name: "📊 Job Summary visuel"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          ## 🚢 Déploiement Plateforme Électronique v12
+          SUMMARY
+
+          echo "| Composant | Statut |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🌐 Frontend (port 30180) | ${{ env.FRONTEND_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔐 Keycloak (port 30881) | ${{ env.KEYCLOAK_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⚡ API Gateway | ${{ env.API_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔄 ArgoCD Sync | $ARGOCD_SYNC |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 💚 ArgoCD Health | $ARGOCD_HEALTH |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🐳 Pods Running | $PODS_RUNNING / $PODS_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🔗 Accès" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | URL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🌐 Frontend | http://$NODE_IP:30180 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔐 Keycloak | http://$NODE_IP:30881 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⚡ API Gateway | http://$API_LB:8080 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔄 ArgoCD UI | http://$ARGOCD_URL |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> **Commit** : \`${{ github.sha }}\` — ${{ github.event.head_commit.message }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "> **Déclenché par** : ${{ github.actor }} — $(date '+%d/%m/%Y %H:%M')" >> "$GITHUB_STEP_SUMMARY"
+
       # ── Résumé final ────────────────────────────────────
       - name: "✅ État final"
         if: always()
