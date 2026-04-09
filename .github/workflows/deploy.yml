@@ -357,9 +357,10 @@ jobs:
             source:
               repoURL: ${{ env.REPO_URL }}
               targetRevision: ${{ env.REPO_BRANCH }}
+              path: "."
               directory:
                 recurse: true
-                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/**/*.yaml'
+                include: '{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/*.yaml'
             destination:
               server: https://kubernetes.default.svc
               namespace: ${{ env.NAMESPACE }}
@@ -378,6 +379,12 @@ jobs:
                   maxDuration: 3m
           EOF
           echo "✅ Application ArgoCD créée / mise à jour"
+
+          # Patch pour garantir path + include corrects
+          sleep 5
+          kubectl patch application plateforme-electronique \
+            -n argocd --type=merge -p='{"spec":{"source":{"path":".","directory":{"recurse":true,"include":"{00-namespace,01-secrets-configmaps,02-infrastructure,03-gateway,04-services,05-frontend,06-ingress,07-keycloak-realm,08-post-deploy}/*.yaml"}}}}'
+          echo "✅ Patch path + include appliqué"
 
       - name: "[ArgoCD 5/5] Afficher mot de passe admin + URLs"
         if: ${{ github.event.inputs.dry_run != 'true' }}
