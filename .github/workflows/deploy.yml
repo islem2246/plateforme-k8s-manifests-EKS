@@ -39,7 +39,7 @@ jobs:
   # JOB 1 — Vérifier le cluster, créer si absent
   # ============================================================
   ensure-cluster:
-    name: "🔎 Vérifier / Créer le cluster EKS"
+    name: " Vérifier / Créer le cluster EKS"
     runs-on: ubuntu-latest
 
     outputs:
@@ -91,7 +91,7 @@ jobs:
               ref: context.ref,
               inputs: { action: 'apply' }
             });
-            console.log('🚀 Workflow Terraform déclenché');
+            console.log(' Workflow Terraform déclenché');
 
       - name: Attendre que le cluster EKS soit ACTIVE (max 20 min)
         if: steps.check.outputs.status != 'ACTIVE'
@@ -120,7 +120,7 @@ jobs:
   # JOB 2 — Validation des manifests YAML
   # ============================================================
   validate-manifests:
-    name: "🔍 Validate Manifests"
+    name: " Validate Manifests"
     runs-on: ubuntu-latest
     needs: ensure-cluster
 
@@ -150,7 +150,7 @@ jobs:
   # JOB 3 — Déploiement + ArgoCD GitOps
   # ============================================================
   deploy:
-    name: "🚢 Deploy Plateforme v12 + ArgoCD"
+    name: " Deploy Plateforme v12 + ArgoCD"
     runs-on: ubuntu-latest
     needs: [ ensure-cluster, validate-manifests ]
     environment: production
@@ -416,7 +416,7 @@ jobs:
           echo "╚══════════════════════════════════════════════════════════╝"
 
       # ── Health Check ─────────────────────────────────────
-      - name: "🏥 Health Check — Vérifier les endpoints"
+      - name: " Health Check — Vérifier les endpoints"
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
           NODE_IP=$(kubectl get nodes \
@@ -513,7 +513,7 @@ jobs:
           echo "ARGOCD_URL=$ARGOCD_URL" >> "$GITHUB_ENV"
 
       # ── Job Summary visuel ───────────────────────────────
-      - name: "📊 Job Summary visuel"
+      - name: " Job Summary visuel"
         if: always()
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
@@ -522,21 +522,21 @@ jobs:
 
           echo "| Composant | Statut |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🌐 Frontend (port 30180) | ${{ env.FRONTEND_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔐 Keycloak (port 30881) | ${{ env.KEYCLOAK_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ⚡ API Gateway | ${{ env.API_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔄 ArgoCD Sync | $ARGOCD_SYNC |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 💚 ArgoCD Health | $ARGOCD_HEALTH |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🐳 Pods Running | $PODS_RUNNING / $PODS_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  Frontend (port 30180) | ${{ env.FRONTEND_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  Keycloak (port 30881) | ${{ env.KEYCLOAK_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  API Gateway | ${{ env.API_OK == 'true' && '✅ UP' || '⚠️ Vérifier' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  ArgoCD Sync | $ARGOCD_SYNC |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  ArgoCD Health | $ARGOCD_HEALTH |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  Pods Running | $PODS_RUNNING / $PODS_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## 🔗 Accès" >> "$GITHUB_STEP_SUMMARY"
           echo "| Service | URL |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🌐 Frontend | http://$NODE_IP:30180 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔐 Keycloak | http://$NODE_IP:30881 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ⚡ API Gateway | http://$API_LB:8080 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔄 ArgoCD UI | http://$ARGOCD_URL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  Frontend | http://$NODE_IP:30180 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  Keycloak | http://$NODE_IP:30881 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  API Gateway | http://$API_LB:8080 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|  ArgoCD UI | http://$ARGOCD_URL |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "> **Commit** : \`${{ github.sha }}\` — ${{ github.event.head_commit.message }}" >> "$GITHUB_STEP_SUMMARY"
@@ -555,7 +555,7 @@ jobs:
           echo "=== Jobs ==="
           kubectl get jobs -n "$NAMESPACE" || true
 
-      - name: "🔴 Debug si échec"
+      - name: " Debug si échec"
         if: failure()
         run: |
           kubectl get pods -n "$NAMESPACE" -o wide || true
