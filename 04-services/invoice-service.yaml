@@ -26,7 +26,7 @@ spec:
           command: ['sh', '-c', 'until nc -z postgres.plateforme-electronique.svc.cluster.local 5432; do sleep 3; done']
       containers:
         - name: invoice-service
-          image: yassmineg/plateforme-invoice-service:latest
+          image: yassmineg/plateforme-invoice:aad0d6e
           ports:
             - containerPort: 8082
               name: http
