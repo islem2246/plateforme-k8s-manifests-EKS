@@ -10,7 +10,7 @@ metadata:
     app: signature-service
     tier: microservice
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: signature-service
