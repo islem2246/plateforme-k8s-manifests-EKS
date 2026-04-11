@@ -29,7 +29,7 @@ spec:
           command: ['sh', '-c', 'until nc -z keycloak.plateforme-electronique.svc.cluster.local 8080; do sleep 5; done']
       containers:
         - name: user-auth-service
-          image: yassmineg/plateforme-userauth:98080a5
+          image: yassmineg/plateforme-userauth:34f95bc
           ports:
             - containerPort: 8081
               name: http
