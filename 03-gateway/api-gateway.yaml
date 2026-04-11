@@ -46,7 +46,7 @@ spec:
               done
       containers:
         - name: api-gateway
-          image: yassmineg/plateforme-gateway:875d796
+          image: yassmineg/plateforme-gateway:6b68e70
           ports:
             - containerPort: 8080
               name: http

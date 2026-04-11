@@ -77,7 +77,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: yassmineg/plateforme-frontend:875d796
+          image: yassmineg/plateforme-frontend:6b68e70
           ports:
             - containerPort: 80
               name: http
