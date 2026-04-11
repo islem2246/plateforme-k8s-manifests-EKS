@@ -26,7 +26,7 @@ spec:
           command: ['sh', '-c', 'until nc -z postgres.plateforme-electronique.svc.cluster.local 5432; do sleep 3; done']
       containers:
         - name: notification-service
-          image: yassmineg/plateforme-notification:34f95bc
+          image: yassmineg/plateforme-notification:bba1670
           ports:
             - containerPort: 8085
               name: http

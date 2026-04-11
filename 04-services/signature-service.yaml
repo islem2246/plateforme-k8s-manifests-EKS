@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: signature-service
-          image: yassmineg/plateforme-signature:34f95bc
+          image: yassmineg/plateforme-signature:bba1670
           ports:
             - containerPort: 8080
               name: http
