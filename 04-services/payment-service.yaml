@@ -26,7 +26,7 @@ spec:
           command: ['sh', '-c', 'until nc -z postgres.plateforme-electronique.svc.cluster.local 5432; do sleep 3; done']
       containers:
         - name: payment-service
-          image: yassmineg/plateforme-payment:0408fea
+          image: yassmineg/plateforme-payment:875d796
           ports:
             - containerPort: 8080
               name: http
